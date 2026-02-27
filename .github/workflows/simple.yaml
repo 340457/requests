@@ -15,515 +15,493 @@ env:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
+    timeout-minutes: 60
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
+      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
+      
       - name: Fetch and Parse Config
         id: config
         run: |
+          # Decode base64 config (without echoing it)
           CONFIG=$(echo "${{ inputs.base64_config }}" | base64 -d)
-
+          
+          # Parse VNC, Cloudflare, and Webshare values (lowercase keys)
           VNC_ENABLED=$(echo "$CONFIG" | jq -r '.vnc_enabled // "false"')
           CLOUDFLARE_ENABLED=$(echo "$CONFIG" | jq -r '.cloudflare_enabled // "false"')
           WEBSHARE_ENABLED=$(echo "$CONFIG" | jq -r '.webshare_enabled // "false"')
           echo "vnc_enabled=$VNC_ENABLED" >> $GITHUB_OUTPUT
           echo "cloudflare_enabled=$CLOUDFLARE_ENABLED" >> $GITHUB_OUTPUT
           echo "webshare_enabled=$WEBSHARE_ENABLED" >> $GITHUB_OUTPUT
-
+          
+          # Parse user_id and workspace_id with defaults
           USER_ID=$(echo "$CONFIG" | jq -r '.user_id // "69c3090b-464d-4de3-9358-ceca1c9e2aa8"')
           WORKSPACE_ID=$(echo "$CONFIG" | jq -r '.workspace_id // "ceae1caa-1538-4859-8e1a-24a8b4904d5f"')
           echo "user_id=$USER_ID" >> $GITHUB_OUTPUT
           echo "workspace_id=$WORKSPACE_ID" >> $GITHUB_OUTPUT
-
+          
+          # Parse VNC password if VNC is enabled
           if [ "$VNC_ENABLED" = "true" ]; then
             VNC_PASSWORD=$(echo "$CONFIG" | jq -r '.vnc_password // ""')
             echo "vnc_password=$VNC_PASSWORD" >> $GITHUB_OUTPUT
           fi
-
+          
+          # Parse Cloudflare-related values if Cloudflare is enabled
           if [ "$CLOUDFLARE_ENABLED" = "true" ]; then
             CLOUDFLARE_API_TOKEN=$(echo "$CONFIG" | jq -r '.cloudflare_api_token // ""')
             CLOUDFLARE_ACCOUNT_ID=$(echo "$CONFIG" | jq -r '.cloudflare_account_id // ""')
             CLOUDFLARE_ZONE_ID=$(echo "$CONFIG" | jq -r '.cloudflare_zone_id // ""')
             HOSTNAME=$(echo "$CONFIG" | jq -r '.hostname // ""')
-            BROWSER_PROFILE_ID=$(echo "$CONFIG" | jq -r '.browser_profile_id // ""')
+            # Extract browser_profile_id from hostname (UUID prefix before first dot)
+            # e.g. "a6b83dc3-1881-4285-957f-3c49c7b162ad.articleinnovator.com" -> "a6b83dc3-1881-4285-957f-3c49c7b162ad"
+            BROWSER_PROFILE_ID=$(echo "$HOSTNAME" | cut -d'.' -f1)
+            CLOUDFLARE_TUNNEL_CREDENTIAL_ID=$(echo "$CONFIG" | jq -r '.cloudflare_tunnel_credential_id // ""')
+
             echo "cloudflare_api_token=$CLOUDFLARE_API_TOKEN" >> $GITHUB_OUTPUT
             echo "cloudflare_account_id=$CLOUDFLARE_ACCOUNT_ID" >> $GITHUB_OUTPUT
             echo "cloudflare_zone_id=$CLOUDFLARE_ZONE_ID" >> $GITHUB_OUTPUT
             echo "hostname=$HOSTNAME" >> $GITHUB_OUTPUT
             echo "browser_profile_id=$BROWSER_PROFILE_ID" >> $GITHUB_OUTPUT
+            echo "cloudflare_tunnel_credential_id=$CLOUDFLARE_TUNNEL_CREDENTIAL_ID" >> $GITHUB_OUTPUT
+
+            echo "✅ Cloudflare Config Loaded"
+            echo "  Hostname: $HOSTNAME"
+            echo "  Browser Profile ID: $BROWSER_PROFILE_ID"
+          fi
+          
+          # Parse Wasabi S3
+          #credentials for browser profile persistence
+          WASABI_ACCESS_KEY=$(echo "$CONFIG" | jq -r '.wasabi_access_key // ""')
+          WASABI_SECRET_KEY=$(echo "$CONFIG" | jq -r '.wasabi_secret_key // ""')
+          WASABI_BUCKET=$(echo "$CONFIG" | jq -r '.wasabi_bucket // ""')
+          WASABI_ENDPOINT=$(echo "$CONFIG" | jq -r '.wasabi_endpoint // "https://s3.wasabisys.com"')
+          WASABI_REGION=$(echo "$CONFIG" | jq -r '.wasabi_region // "us-east-1"')
+          echo "wasabi_access_key=$WASABI_ACCESS_KEY" >> $GITHUB_OUTPUT
+          echo "wasabi_secret_key=$WASABI_SECRET_KEY" >> $GITHUB_OUTPUT
+          echo "wasabi_bucket=$WASABI_BUCKET" >> $GITHUB_OUTPUT
+          echo "wasabi_endpoint=$WASABI_ENDPOINT" >> $GITHUB_OUTPUT
+          echo "wasabi_region=$WASABI_REGION" >> $GITHUB_OUTPUT
+
+          if [ -n "$WASABI_ACCESS_KEY" ] && [ "$WASABI_ACCESS_KEY" != "" ]; then
+            echo "✅ Wasabi Config Loaded (Bucket: $WASABI_BUCKET)"
           fi
 
+          # Parse Webshare-related values if Webshare is enabled
           if [ "$WEBSHARE_ENABLED" = "true" ]; then
             WEBSHARE_API_TOKEN=$(echo "$CONFIG" | jq -r '.webshare_api_token // ""')
             echo "webshare_api_token=$WEBSHARE_API_TOKEN" >> $GITHUB_OUTPUT
+            
+            echo "✅ Webshare Config Loaded"
           fi
-
-          echo "✅ Config: VNC=$VNC_ENABLED | Cloudflare=$CLOUDFLARE_ENABLED | Webshare=$WEBSHARE_ENABLED"
-
+          
+          echo "✅ Config Loaded:"
+          echo "  VNC: $VNC_ENABLED"
+          echo "  Cloudflare: $CLOUDFLARE_ENABLED"
+          echo "  Webshare: $WEBSHARE_ENABLED"
+          echo "  User ID: $USER_ID"
+          echo "  Workspace ID: $WORKSPACE_ID"
+      
       - name: Register IP with Webshare
         if: steps.config.outputs.webshare_enabled == 'true'
         id: webshare
+        timeout-minutes: 2
         run: |
-          PUBLIC_IP=$(curl -s 'https://api.ipify.org?format=json' | jq -r '.ip')
-          RESPONSE=$(curl -s "https://proxy.webshare.io/api/v2/proxy/ipauthorization/" \
-            -X POST -d "{\"ip_address\": \"$PUBLIC_IP\"}" \
+          echo "Registering IP with Webshare..."
+
+          # Get current public IP (with timeout and retry)
+          PUBLIC_IP=""
+          for attempt in 1 2 3; do
+            PUBLIC_IP=$(curl -s --connect-timeout 10 --max-time 15 'https://api.ipify.org?format=json' | jq -r '.ip // empty')
+            if [ -n "$PUBLIC_IP" ]; then
+              break
+            fi
+            echo "Retrying IP fetch... ($attempt/3)"
+            sleep 2
+          done
+
+          if [ -z "$PUBLIC_IP" ]; then
+            echo "⚠️ Failed to get public IP, skipping Webshare registration"
+            exit 0
+          fi
+          echo "Public IP: $PUBLIC_IP"
+
+          # Register IP with Webshare
+          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            "https://proxy.webshare.io/api/v2/proxy/ipauthorization/" \
+            -X POST \
+            -d "{\"ip_address\": \"$PUBLIC_IP\"}" \
             -H "Content-Type: application/json" \
             -H "Authorization: Token ${{ steps.config.outputs.webshare_api_token }}")
-          AUTH_ID=$(echo "$RESPONSE" | jq -r '.id // empty')
-          [ -n "$AUTH_ID" ] && echo "webshare_auth_id=$AUTH_ID" >> $GITHUB_OUTPUT && echo "✅ IP registered (Auth ID: $AUTH_ID)" || echo "⚠️ Webshare registration failed"
 
+          # Extract authorization ID
+          AUTH_ID=$(echo "$RESPONSE" | jq -r '.id // empty')
+
+          if [ -n "$AUTH_ID" ]; then
+            echo "webshare_auth_id=$AUTH_ID" >> $GITHUB_OUTPUT
+            echo "✅ IP registered with Webshare (Auth ID: $AUTH_ID)"
+          else
+            echo "⚠️ Failed to register IP with Webshare"
+            echo "$RESPONSE" | jq '.'
+          fi
+      
       - name: Install Desktop Environment
         if: steps.config.outputs.vnc_enabled == 'true'
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 xfce4-goodies xfce4-terminal firefox \
-            dbus-x11 dbus-user-session \
-            x11-utils x11-apps x11-common x11-session-utils x11-xserver-utils \
-            xfonts-base xfonts-100dpi xfonts-75dpi xfonts-cyrillic \
-            xubuntu-icon-theme xubuntu-wallpapers gnome-icon-theme
+          echo "Installing XFCE desktop environment..."
+
+          # Kill unattended-upgrades to prevent dpkg lock contention
+          sudo systemctl stop unattended-upgrades 2>/dev/null || true
+          sudo killall -9 unattended-upgrades 2>/dev/null || true
+          sudo killall -9 dpkg 2>/dev/null || true
+
+          # Wait for any existing dpkg lock to release (max 60s)
+          for i in $(seq 1 12); do
+            if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+              break
+            fi
+            echo "Waiting for dpkg lock to release... ($i/12)"
+            sleep 5
+          done
+
+          # Enable parallel downloads
+          echo 'Acquire::Queue-Mode "access";' | sudo tee /etc/apt/apt.conf.d/99parallel
+          echo 'APT::Acquire::Retries "3";' | sudo tee -a /etc/apt/apt.conf.d/99parallel
+
+          sudo apt-get update -q
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            xfce4 \
+            xfce4-terminal \
+            dbus-x11 \
+            x11-utils \
+            x11-xserver-utils \
+            xfonts-base
 
       - name: Install Google Chrome
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
+          echo "Installing Google Chrome..."
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
           rm google-chrome-stable_current_amd64.deb
           google-chrome --version
-          echo "✅ Chrome installed"
+          echo "✅ Google Chrome installed"
 
       - name: Install TurboVNC Server
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
+          echo "Installing TurboVNC server..."
           wget -q https://phoenixnap.dl.sourceforge.net/project/turbovnc/2.2.5/turbovnc_2.2.5_amd64.deb
           sudo dpkg -i turbovnc_2.2.5_amd64.deb
           rm turbovnc_2.2.5_amd64.deb
 
-      - name: Install noVNC
+      - name: Install noVNC (Web VNC)
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
+          echo "Installing noVNC for web-based access..."
           cd ~
           git clone https://github.com/novnc/noVNC.git
-          cd noVNC && git clone https://github.com/novnc/websockify.git
+          cd noVNC
+          git clone https://github.com/novnc/websockify.git
 
-      - name: Configure and Start VNC Server
+      - name: Configure VNC Server
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
           export PATH=$PATH:/opt/TurboVNC/bin
           mkdir -p ~/.vnc
+          
+          # Create password file
           echo "${{ steps.config.outputs.vnc_password }}" | vncpasswd -f > ~/.vnc/passwd
           chmod 600 ~/.vnc/passwd
-
+          
+          # Create xstartup script
           cat > ~/.vnc/xstartup.turbovnc << 'EOF'
           #!/bin/bash
+          # Suppress accessibility warnings
           export NO_AT_BRIDGE=1
           export SESSION_MANAGER=""
+          
+          # Start XFCE desktop
           dbus-launch /usr/bin/startxfce4 &
           EOF
+          
           chmod +x ~/.vnc/xstartup.turbovnc
 
-          vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT 2>&1 | tee /tmp/vnc-start.log
-          sleep 8
-          pgrep -f "Xvnc.*:1" > /dev/null && echo "✅ VNC started" || { cat /tmp/vnc-start.log; exit 1; }
-
-      - name: Install Python dependencies
-        if: steps.config.outputs.vnc_enabled == 'true'
-        run: pip install numpy websocket-client
-
-      - name: Start noVNC
+      - name: Start VNC Server
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
+          export PATH=$PATH:/opt/TurboVNC/bin
+          echo "Starting TurboVNC server on display :1..."
+          
+          vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT 2>&1 | tee /tmp/vnc-start.log
+          sleep 8
+          
+          if pgrep -f "Xvnc.*:1" > /dev/null; then
+            echo "✅ TurboVNC Server started successfully on port $VNC_PORT"
+            ps aux | grep Xvnc | grep -v grep
+          else
+            echo "❌ Failed to start VNC server"
+            cat /tmp/vnc-start.log
+            exit 1
+          fi
+
+      - name: Start noVNC (Web VNC)
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Starting noVNC web server..."
           cd ~/noVNC
-          [ ! -f ./utils/websockify/run ] && cd utils && git clone https://github.com/novnc/websockify.git && cd ..
           ./utils/novnc_proxy --vnc localhost:$VNC_PORT --listen $NOVNC_PORT &
-          sleep 5
-          ss -tuln | grep -q ":$NOVNC_PORT " && echo "✅ noVNC started" || echo "⚠️ noVNC port check failed (may still be binding)"
+          sleep 3
+          
+          if netstat -tuln | grep :$NOVNC_PORT > /dev/null; then
+            echo "✅ noVNC started successfully on port $NOVNC_PORT"
+          else
+            echo "❌ noVNC failed to start"
+            exit 1
+          fi
 
       - name: Download and Setup BotXByte Extension
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
-          EXTENSION_DIR="$HOME/real-botxbyte-extension"
+          echo "Downloading BotXByte extension..."
 
-          wget -q -O /tmp/real-botxbyte-extension.zip "https://github.com/user-attachments/files/25434674/real-botxbyte-extension.zip"
+          # Install python3-venv
+          sudo apt-get install -y python3 python3-venv
+
+          DOWNLOADS_DIR="$HOME/Downloads"
+          EXTENSION_DIR="$DOWNLOADS_DIR/real-botxbyte-extension"
+          mkdir -p "$DOWNLOADS_DIR"
+
+          # Download the extension zip
+          wget -q -O "$DOWNLOADS_DIR/real-botxbyte-extension.zip" \
+            "https://github.com/user-attachments/files/25457672/real-botxbyte-extension.zip"
+
+          # Extract to a temp location to handle nested directories
           TEMP_EXTRACT="/tmp/extension-extract"
-          rm -rf "$TEMP_EXTRACT" && mkdir -p "$TEMP_EXTRACT"
-          unzip -o /tmp/real-botxbyte-extension.zip -d "$TEMP_EXTRACT"
-          rm /tmp/real-botxbyte-extension.zip
+          rm -rf "$TEMP_EXTRACT"
+          mkdir -p "$TEMP_EXTRACT"
+          unzip -o "$DOWNLOADS_DIR/real-botxbyte-extension.zip" -d "$TEMP_EXTRACT"
+          rm "$DOWNLOADS_DIR/real-botxbyte-extension.zip"
 
+          # Find where manifest.json actually is
           MANIFEST_PATH=$(find "$TEMP_EXTRACT" -name "manifest.json" -type f | head -1)
-          [ -z "$MANIFEST_PATH" ] && echo "❌ manifest.json not found" && exit 1
+          if [ -z "$MANIFEST_PATH" ]; then
+            echo "❌ manifest.json not found in extracted zip!"
+            find "$TEMP_EXTRACT" -type f
+            exit 1
+          fi
 
           ACTUAL_EXT_DIR=$(dirname "$MANIFEST_PATH")
+          echo "Found manifest.json at: $MANIFEST_PATH"
+
+          # Move to the expected location
           rm -rf "$EXTENSION_DIR"
           mv "$ACTUAL_EXT_DIR" "$EXTENSION_DIR"
           rm -rf "$TEMP_EXTRACT"
 
-          # Remove stale/problematic files
-          rm -rf "$EXTENSION_DIR/_metadata"
-          rm -rf "$EXTENSION_DIR/.git"
+          # Clean up stale/non-extension files
+          rm -rf "$EXTENSION_DIR/_metadata" 2>/dev/null || true
+          rm -rf "$EXTENSION_DIR/.git" 2>/dev/null || true
           rm -f "$EXTENSION_DIR/.gitignore" "$EXTENSION_DIR/.env.dev" "$EXTENSION_DIR/README.md" "$EXTENSION_DIR/llm.txt"
 
-          # ----------------------------------------------------------------
-          # CRITICAL DIAGNOSTIC: Validate the manifest before launching Chrome
-          # A bad manifest is the #1 reason Chrome silently refuses to load
-          # an extension, even via --load-extension.
-          # ----------------------------------------------------------------
-          echo "=== manifest.json ==="
+          echo "Extension contents:"
+          ls -la "$EXTENSION_DIR/"
+          echo "manifest.json:"
           cat "$EXTENSION_DIR/manifest.json"
-          echo ""
 
-          echo "=== Manifest validation ==="
-          python3 << 'PYEOF'
-          import json, sys, os
+          # Set up Python virtual environment and install requirements
+          cd "$EXTENSION_DIR"
+          python3 -m venv venv
+          source venv/bin/activate
 
-          ext_dir = os.path.expanduser("~/real-botxbyte-extension")
-          mf_path = os.path.join(ext_dir, "manifest.json")
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+            echo "✅ Requirements installed in venv"
+          else
+            echo "⚠️ No requirements.txt found"
+          fi
 
-          try:
-              with open(mf_path) as f:
-                  m = json.load(f)
-          except json.JSONDecodeError as e:
-              print(f"❌ INVALID JSON in manifest.json: {e}")
-              sys.exit(1)
+          echo "✅ BotXByte Extension setup complete"
+          echo "  Extension path: $EXTENSION_DIR"
 
-          print(f"✅ manifest.json is valid JSON")
-          print(f"  Name: {m.get('name','?')}")
-          print(f"  Version: {m.get('version','?')}")
-          print(f"  Manifest version: {m.get('manifest_version','?')}")
+      - name: Download and Setup CF AutoClick Extension
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Downloading CF AutoClick extension..."
 
-          # Check manifest version
-          mv = m.get('manifest_version', 0)
-          if mv not in (2, 3):
-              print(f"❌ manifest_version must be 2 or 3, got: {mv}")
-              sys.exit(1)
+          DOWNLOADS_DIR="$HOME/Downloads"
+          EXTENSION_DIR="$DOWNLOADS_DIR/cf-autoclick-extension"
+          mkdir -p "$DOWNLOADS_DIR"
 
-          # For MV3: background must use service_worker, not scripts
-          bg = m.get('background', {})
-          if mv == 3:
-              if 'scripts' in bg and 'service_worker' not in bg:
-                  print(f"❌ MV3 background must use 'service_worker', not 'scripts'")
-                  sys.exit(1)
-              if 'service_worker' in bg:
-                  sw_path = os.path.join(ext_dir, bg['service_worker'])
-                  if not os.path.exists(sw_path):
-                      print(f"❌ service_worker file missing: {bg['service_worker']}")
-                      sys.exit(1)
-                  print(f"✅ service_worker: {bg['service_worker']} exists")
+          # Download the extension zip
+          wget -q -O "$DOWNLOADS_DIR/cf-autoclick-master.zip" \
+            "https://github.com/user-attachments/files/25514727/cf-autoclick-master.zip"
 
-          # For MV2: check background scripts exist
-          if mv == 2 and 'scripts' in bg:
-              for s in bg['scripts']:
-                  sp = os.path.join(ext_dir, s)
-                  if not os.path.exists(sp):
-                      print(f"❌ background script missing: {s}")
-                  else:
-                      print(f"✅ background script: {s} exists")
+          # Extract to a temp location to handle nested directories
+          TEMP_EXTRACT="/tmp/cf-autoclick-extract"
+          rm -rf "$TEMP_EXTRACT"
+          mkdir -p "$TEMP_EXTRACT"
+          unzip -o "$DOWNLOADS_DIR/cf-autoclick-master.zip" -d "$TEMP_EXTRACT"
+          rm "$DOWNLOADS_DIR/cf-autoclick-master.zip"
 
-          # Check content scripts exist
-          for cs in m.get('content_scripts', []):
-              for js in cs.get('js', []):
-                  p = os.path.join(ext_dir, js)
-                  if not os.path.exists(p):
-                      print(f"❌ content script missing: {js}")
-                  else:
-                      print(f"✅ content script: {js} exists")
+          # Find where manifest.json actually is
+          MANIFEST_PATH=$(find "$TEMP_EXTRACT" -name "manifest.json" -type f | head -1)
+          if [ -z "$MANIFEST_PATH" ]; then
+            echo "❌ manifest.json not found in extracted zip!"
+            find "$TEMP_EXTRACT" -type f
+            exit 1
+          fi
 
-          # Check for web_accessible_resources format (MV3 changed this)
-          war = m.get('web_accessible_resources', [])
-          if mv == 3 and war and isinstance(war[0], str):
-              print(f"❌ MV3 web_accessible_resources must be objects with 'resources' and 'matches', not strings")
-              sys.exit(1)
+          ACTUAL_EXT_DIR=$(dirname "$MANIFEST_PATH")
+          echo "Found manifest.json at: $MANIFEST_PATH"
 
-          # Check icons exist
-          for size, path in m.get('icons', {}).items():
-              p = os.path.join(ext_dir, path)
-              if not os.path.exists(p):
-                  print(f"⚠️ icon missing: {path} (size {size})")
+          # Move to the expected location
+          rm -rf "$EXTENSION_DIR"
+          mv "$ACTUAL_EXT_DIR" "$EXTENSION_DIR"
+          rm -rf "$TEMP_EXTRACT"
 
-          # Check action/browser_action
-          action = m.get('action') or m.get('browser_action') or {}
-          for k in ['default_popup', 'default_icon']:
-              v = action.get(k)
-              if v and isinstance(v, str):
-                  p = os.path.join(ext_dir, v)
-                  if not os.path.exists(p):
-                      print(f"⚠️ action file missing: {v}")
+          echo "Extension contents:"
+          ls -la "$EXTENSION_DIR/"
+          echo "manifest.json:"
+          cat "$EXTENSION_DIR/manifest.json"
 
-          print("")
-          print("=== All extension files ===")
-          for root, dirs, files in os.walk(ext_dir):
-              dirs[:] = [d for d in dirs if d not in ['.git', '__pycache__', 'node_modules']]
-              level = root.replace(ext_dir, '').count(os.sep)
-              indent = '  ' * level
-              print(f'{indent}{os.path.basename(root)}/')
-              for f in files:
-                  fp = os.path.join(root, f)
-                  size = os.path.getsize(fp)
-                  print(f'{indent}  {f} ({size} bytes)')
-
-          print("\n✅ Manifest validation passed")
-          PYEOF
-
-          # Install Python deps
-          [ -f "$EXTENSION_DIR/requirements.txt" ] && pip install -r "$EXTENSION_DIR/requirements.txt" || true
-
-          echo "✅ Extension setup complete at: $EXTENSION_DIR"
+          echo "✅ CF AutoClick Extension setup complete"
+          echo "  Extension path: $EXTENSION_DIR"
 
       - name: Start BotXByte Server
         if: steps.config.outputs.vnc_enabled == 'true'
         id: botxbyte_server
         run: |
-          EXTENSION_DIR="$HOME/real-botxbyte-extension"
-          export WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+          echo "Starting BotXByte server (server.py)..."
+
+          EXTENSION_DIR="$HOME/Downloads/real-botxbyte-extension"
           cd "$EXTENSION_DIR"
-          nohup python3 server.py > /tmp/botxbyte-server.log 2>&1 &
+
+          source venv/bin/activate
+          export WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+
+          python3 server.py &
           SERVER_PID=$!
           echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
-          sleep 3
-          kill -0 $SERVER_PID 2>/dev/null && echo "✅ BotXByte server started (PID: $SERVER_PID)" || { echo "❌ Server failed"; cat /tmp/botxbyte-server.log; exit 1; }
 
-      - name: Launch Chrome with BotXByte Extension
+          sleep 3
+
+          if kill -0 $SERVER_PID 2>/dev/null; then
+            echo "✅ BotXByte server started (PID: $SERVER_PID)"
+            echo "  WebSocket: ws://localhost:8765"
+            echo "  HTTP API:  http://localhost:8766"
+          else
+            echo "❌ BotXByte server failed to start"
+            exit 1
+          fi
+
+      - name: Setup Browser Profile
+        if: steps.config.outputs.vnc_enabled == 'true'
+        id: browser_profile
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.config.outputs.wasabi_access_key }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.config.outputs.wasabi_secret_key }}
+          AWS_DEFAULT_REGION: ${{ steps.config.outputs.wasabi_region }}
+        run: |
+          BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          WASABI_BUCKET="${{ steps.config.outputs.wasabi_bucket }}"
+          WASABI_ENDPOINT="${{ steps.config.outputs.wasabi_endpoint }}"
+          PROFILE_DIR="$HOME/browser-profiles/${BROWSER_PROFILE_ID}"
+          WASABI_KEY="browser-profiles/${BROWSER_PROFILE_ID}.zip"
+
+          echo "browser_profile_dir=$PROFILE_DIR" >> $GITHUB_OUTPUT
+
+          mkdir -p "$HOME/browser-profiles"
+
+          PROFILE_EXISTS="false"
+
+          # Check if browser profile exists in Wasabi
+          if [ -n "$WASABI_BUCKET" ] && [ "$WASABI_BUCKET" != "" ] && [ -n "$BROWSER_PROFILE_ID" ] && [ "$BROWSER_PROFILE_ID" != "" ]; then
+            echo "Checking Wasabi for existing browser profile: $WASABI_KEY"
+
+            if aws s3 ls "s3://${WASABI_BUCKET}/${WASABI_KEY}" --endpoint-url "$WASABI_ENDPOINT" 2>/dev/null; then
+              echo "✅ Browser profile found in Wasabi! Downloading..."
+              PROFILE_EXISTS="true"
+
+              # Download the zip
+              aws s3 cp "s3://${WASABI_BUCKET}/${WASABI_KEY}" "/tmp/${BROWSER_PROFILE_ID}.zip" \
+                --endpoint-url "$WASABI_ENDPOINT"
+
+              echo "Extracting browser profile..."
+              unzip -o "/tmp/${BROWSER_PROFILE_ID}.zip" -d "$HOME/browser-profiles/"
+              rm -f "/tmp/${BROWSER_PROFILE_ID}.zip"
+
+              if [ -d "$PROFILE_DIR" ]; then
+                echo "✅ Browser profile extracted to: $PROFILE_DIR"
+                echo "  Profile size: $(du -sh "$PROFILE_DIR" | cut -f1)"
+              else
+                echo "⚠️ Extraction did not produce expected directory, creating fresh profile"
+                PROFILE_EXISTS="false"
+              fi
+            else
+              echo "No existing browser profile found in Wasabi"
+            fi
+          else
+            echo "⚠️ Wasabi not configured or no browser_profile_id, using fresh profile"
+          fi
+
+          # If no profile exists, create a fresh one
+          if [ "$PROFILE_EXISTS" = "false" ]; then
+            echo "Creating fresh browser profile: $PROFILE_DIR"
+            mkdir -p "$PROFILE_DIR"
+            echo "✅ Fresh browser profile directory created"
+          fi
+
+          echo "profile_exists=$PROFILE_EXISTS" >> $GITHUB_OUTPUT
+          echo "Browser Profile ID: $BROWSER_PROFILE_ID"
+          echo "Profile Directory: $PROFILE_DIR"
+
+      - name: Open Chrome on Desktop
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
+          echo "Opening Chrome on VNC desktop with browser profile..."
+
+          PROFILE_DIR="${{ steps.browser_profile.outputs.browser_profile_dir }}"
+          echo "Using profile directory: $PROFILE_DIR"
+
           export DISPLAY=:1
           export NO_AT_BRIDGE=1
           export DBUS_SESSION_BUS_ADDRESS=/dev/null
 
-          EXTENSION_DIR="$HOME/real-botxbyte-extension"
-          CHROME_PROFILE_DIR="$HOME/chrome-botxbyte-profile"
-
-          rm -rf "$CHROME_PROFILE_DIR"
-          mkdir -p "$CHROME_PROFILE_DIR/Default"
-          rm -rf "$EXTENSION_DIR/_metadata"
-
-          # ----------------------------------------------------------------
-          # Chrome policy: allow unpacked extensions and developer mode
-          # ----------------------------------------------------------------
-          sudo mkdir -p /etc/opt/chrome/policies/managed
-          cat << 'POLICY' | sudo tee /etc/opt/chrome/policies/managed/policy.json > /dev/null
-          {
-            "ExtensionSettings": {
-              "*": { "installation_mode": "allowed" }
-            },
-            "DeveloperToolsAvailability": 1,
-            "ExtensionDeveloperModeAllowed": true,
-            "BlockExternalExtensions": false,
-            "CommandLineFlagSecurityWarningsEnabled": false
-          }
-          POLICY
-
-          # ----------------------------------------------------------------
-          # Pre-seed Preferences BEFORE Chrome launches.
-          # This tells Chrome developer mode is already on.
-          # Chrome will re-compute HMACs itself on first read.
-          # ----------------------------------------------------------------
-          cat > "$CHROME_PROFILE_DIR/Default/Preferences" << 'PREFS_EOF'
-          {
-            "extensions": {
-              "ui": {
-                "developer_mode": true
-              },
-              "alerts": {
-                "initialized": true
-              }
-            },
-            "profile": {
-              "exit_type": "Normal",
-              "exited_cleanly": true
-            },
-            "browser": {
-              "has_seen_welcome_page": true
-            }
-          }
-          PREFS_EOF
-
-          touch "$CHROME_PROFILE_DIR/First Run"
-
-          # ----------------------------------------------------------------
-          # Launch Chrome with extension.
-          #
-          # KEY FLAGS EXPLAINED:
-          # --load-extension          : Load unpacked extension from path
-          # --no-sandbox              : Required on GitHub runners (no user namespace)
-          # --disable-extensions-except: NOT used — this would BLOCK our extension!
-          # --allow-legacy-extension-manifests: accept both MV2 and MV3
-          # ----------------------------------------------------------------
-          echo "Launching Chrome..."
           google-chrome \
             --no-first-run \
             --no-default-browser-check \
             --disable-gpu \
             --no-sandbox \
             --disable-dev-shm-usage \
-            --enable-extensions \
-            --load-extension="$EXTENSION_DIR" \
-            --allow-legacy-extension-manifests \
-            --user-data-dir="$CHROME_PROFILE_DIR" \
-            --remote-debugging-port=9222 \
-            --new-window \
-            "about:blank" \
+            --user-data-dir="$PROFILE_DIR" \
             2>/tmp/chrome-stderr.log &
 
           CHROME_PID=$!
-          echo "Chrome PID: $CHROME_PID"
+          echo "  Chrome PID: $CHROME_PID"
+          sleep 5
 
-          # Wait for Chrome to fully start (longer wait = more reliable)
-          sleep 20
-
-          if ! pgrep -f "google-chrome" > /dev/null; then
-            echo "❌ Chrome crashed on launch"
-            echo "=== Chrome stderr ==="
-            cat /tmp/chrome-stderr.log
+          if pgrep -f "chrome" > /dev/null; then
+            echo "✅ Chrome is running with persistent profile"
+          else
+            echo "❌ Chrome failed to launch"
+            tail -20 /tmp/chrome-stderr.log 2>/dev/null || true
             exit 1
           fi
-          echo "✅ Chrome is running"
-
-          # Check stderr for extension errors
-          echo "=== Chrome stderr (extension-related lines) ==="
-          grep -i "extension\|load\|error\|warn\|manifest\|crx" /tmp/chrome-stderr.log 2>/dev/null | head -30 || echo "(no matching lines)"
-
-          # ----------------------------------------------------------------
-          # Verify via CDP — wait for extension service worker to appear
-          # ----------------------------------------------------------------
-          python3 << 'PYEOF'
-          import websocket, json, time, urllib.request, sys
-
-          def cdp_http(path):
-              try:
-                  resp = urllib.request.urlopen(f"http://localhost:9222{path}", timeout=10)
-                  return json.loads(resp.read())
-              except Exception as e:
-                  print(f"  CDP HTTP error on {path}: {e}")
-                  return None
-
-          def cdp_send(ws, method, params=None, msg_id=1):
-              msg = {"id": msg_id, "method": method}
-              if params:
-                  msg["params"] = params
-              ws.send(json.dumps(msg))
-              for _ in range(100):
-                  resp = json.loads(ws.recv())
-                  if resp.get("id") == msg_id:
-                      return resp
-              return {}
-
-          # Poll for extension service worker (up to 30 seconds)
-          print("Waiting for extension service worker...")
-          ext_sw = None
-          for attempt in range(15):
-              time.sleep(2)
-              targets = cdp_http("/json/list") or []
-              for t in targets:
-                  if t.get("type") == "service_worker" and "nmmhkkegccagdldgiimedpiccmgmieda" not in t.get("url",""):
-                      ext_sw = t
-                      break
-              if ext_sw:
-                  break
-              print(f"  Attempt {attempt+1}/15: no extension service worker yet... ({len(targets)} targets)")
-
-          print("\n=== All CDP targets ===")
-          targets = cdp_http("/json/list") or []
-          for t in targets:
-              print(f"  [{t.get('type','?')}] {t.get('url','?')[:100]}")
-
-          if ext_sw:
-              print(f"\n✅ Extension service worker ACTIVE: {ext_sw.get('url')}")
-              sw_id = ext_sw.get('url','').split('/')[2] if '/' in ext_sw.get('url','') else 'unknown'
-              print(f"  Extension ID: {sw_id}")
-          else:
-              print("\n⚠️  Extension service worker NOT found")
-              print("Possible causes:")
-              print("  1. manifest.json has errors Chrome rejected silently")
-              print("  2. The extension uses MV2 (background page, not service worker)")
-              print("  3. Chrome blocked --load-extension for security reasons")
-
-              # For MV2 extensions, look for background_page instead
-              mv2_bg = [t for t in targets if t.get("type") == "background_page"
-                        and "nmmhkkegccagdldgiimedpiccmgmieda" not in t.get("url","")]
-              if mv2_bg:
-                  print(f"\n✅ Found MV2 background page (extension IS loaded):")
-                  for t in mv2_bg:
-                      print(f"  {t.get('url')}")
-
-          # Check chrome://extensions via CDP to see what's shown in UI
-          print("\n=== chrome://extensions UI check ===")
-          # Navigate a tab to chrome://extensions
-          tab_list = cdp_http("/json/list") or []
-          page_tab = next((t for t in tab_list if t.get("type") == "page"), None)
-
-          if page_tab and page_tab.get("webSocketDebuggerUrl"):
-              try:
-                  ws = websocket.create_connection(page_tab["webSocketDebuggerUrl"], timeout=15)
-                  # Navigate to extensions page
-                  cdp_send(ws, "Page.navigate", {"url": "chrome://extensions"}, msg_id=10)
-                  time.sleep(4)
-
-                  result = cdp_send(ws, "Runtime.evaluate", {
-                      "expression": """
-                      (async function() {
-                          // Wait for shadow DOM to be ready
-                          for (let i = 0; i < 20; i++) {
-                              const manager = document.querySelector('extensions-manager');
-                              if (manager && manager.shadowRoot) {
-                                  const toolbar = manager.shadowRoot.querySelector('extensions-toolbar');
-                                  const devMode = toolbar?.shadowRoot?.querySelector('#devMode')?.checked;
-                                  const items = Array.from(manager.shadowRoot.querySelectorAll('extensions-item'));
-                                  const exts = items.map(item => ({
-                                      name: item.shadowRoot?.querySelector('#name')?.textContent?.trim() || 'unknown',
-                                      id: item.getAttribute('id') || '?',
-                                      enabled: !item.shadowRoot?.querySelector('cr-toggle')?.hasAttribute('disabled')
-                                  }));
-                                  return JSON.stringify({devMode, extensions: exts, ready: true});
-                              }
-                              await new Promise(r => setTimeout(r, 500));
-                          }
-                          return JSON.stringify({error: 'extensions-manager not found', ready: false});
-                      })()
-                      """,
-                      "awaitPromise": True
-                  }, msg_id=11)
-
-                  val = result.get("result",{}).get("result",{}).get("value","{}") or "{}"
-                  try:
-                      data = json.loads(val)
-                      if data.get("error"):
-                          print(f"  ⚠️ {data['error']}")
-                      else:
-                          print(f"  Developer mode: {'ON ✅' if data.get('devMode') else 'OFF ⚠️'}")
-                          exts = data.get("extensions", [])
-                          print(f"  Extensions in UI: {len(exts)}")
-                          for e in exts:
-                              status = "✅" if e.get("enabled") else "⚠️ disabled"
-                              print(f"    {status} {e.get('name')} (ID: {e.get('id')})")
-                          if not exts:
-                              print("  ❌ No extensions shown in chrome://extensions")
-                  except Exception as parse_err:
-                      print(f"  Parse error: {parse_err}, raw: {val[:200]}")
-
-                  ws.close()
-              except Exception as e:
-                  print(f"  CDP error: {e}")
-
-          version = cdp_http("/json/version") or {}
-          print(f"\nChrome version: {version.get('Browser','?')}")
-          PYEOF
-
-          echo ""
-          echo "=== Summary ==="
-          pgrep -f "google-chrome" > /dev/null && echo "✅ Chrome: running" || echo "❌ Chrome: NOT running"
-          pgrep -f "server.py" > /dev/null && echo "✅ BotXByte server: running" || echo "⚠️ BotXByte server: NOT running"
 
       - name: Install cloudflared
         if: steps.config.outputs.cloudflare_enabled == 'true'
         run: |
+          echo "Installing cloudflared..."
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared-linux-amd64.deb
           cloudflared --version
@@ -532,202 +510,503 @@ jobs:
         if: steps.config.outputs.cloudflare_enabled == 'true'
         id: tunnel
         run: |
-          RESPONSE=$(curl -s -A "Mozilla/5.0" \
+          echo "Creating Cloudflare Tunnel..."
+          
+          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel" \
             --request POST \
             --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" \
             --header "Content-Type: application/json" \
-            --data '{"name":"github-vnc-'"$(date +%s)"'","config_src":"cloudflare"}')
-
+            --data '{
+              "name": "github-vnc-'$(date +%s)'",
+              "config_src": "cloudflare"
+            }')
+          
+          # Check if tunnel creation was successful
           SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
-          [ "$SUCCESS" != "true" ] && echo "❌ Failed to create tunnel" && echo "$RESPONSE" | jq '.' && exit 1
-
-          echo "tunnel_id=$(echo "$RESPONSE" | jq -r '.result.id')" >> $GITHUB_OUTPUT
-          echo "tunnel_token=$(echo "$RESPONSE" | jq -r '.result.token')" >> $GITHUB_OUTPUT
-          echo "✅ Tunnel created"
+          if [ "$SUCCESS" != "true" ]; then
+            echo "❌ Failed to create tunnel"
+            echo "$RESPONSE" | jq '.'
+            exit 1
+          fi
+          
+          TUNNEL_ID=$(echo "$RESPONSE" | jq -r '.result.id')
+          TUNNEL_TOKEN=$(echo "$RESPONSE" | jq -r '.result.token')
+          
+          if [ -z "$TUNNEL_ID" ] || [ "$TUNNEL_ID" = "null" ]; then
+            echo "❌ Failed to extract tunnel ID"
+            exit 1
+          fi
+          
+          echo "tunnel_id=$TUNNEL_ID" >> $GITHUB_OUTPUT
+          echo "tunnel_token=$TUNNEL_TOKEN" >> $GITHUB_OUTPUT
+          echo "✅ Tunnel created: $TUNNEL_ID"
 
       - name: Configure Tunnel
         if: steps.config.outputs.cloudflare_enabled == 'true'
         run: |
-          RESPONSE=$(curl -s -A "Mozilla/5.0" \
+          echo "Configuring tunnel for noVNC..."
+          
+          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${{ steps.tunnel.outputs.tunnel_id }}/configurations" \
             --request PUT \
             --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" \
             --header "Content-Type: application/json" \
-            --data "{\"config\":{\"ingress\":[
-              {\"hostname\":\"${{ steps.config.outputs.hostname }}\",\"path\":\"/vnc/*\",\"service\":\"http://localhost:${NOVNC_PORT}\",\"originRequest\":{}},
-              {\"hostname\":\"${{ steps.config.outputs.hostname }}\",\"path\":\"/browser-agent-management-service/*\",\"service\":\"http://localhost:8801\",\"originRequest\":{}},
-              {\"hostname\":\"${{ steps.config.outputs.hostname }}\",\"service\":\"http://localhost:${NOVNC_PORT}\",\"originRequest\":{}},
-              {\"service\":\"http_status:404\"}
-            ]}}")
-          echo "$RESPONSE" | jq -r '.success' | grep -q true && echo "✅ Tunnel configured" || { echo "❌ Tunnel config failed"; echo "$RESPONSE" | jq '.'; exit 1; }
+            --data "{
+              \"config\": {
+                \"ingress\": [
+                  {
+                    \"hostname\": \"${{ steps.config.outputs.hostname }}\",
+                    \"path\": \"/vnc/*\",
+                    \"service\": \"http://localhost:${NOVNC_PORT}\",
+                    \"originRequest\": {}
+                  },
+                  {
+                    \"hostname\": \"${{ steps.config.outputs.hostname }}\",
+                    \"path\": \"/browser-agent-management-service/*\",
+                    \"service\": \"http://localhost:8766\",
+                    \"originRequest\": {}
+                  },
+                  {
+                    \"hostname\": \"${{ steps.config.outputs.hostname }}\",
+                    \"service\": \"http://localhost:${NOVNC_PORT}\",
+                    \"originRequest\": {}
+                  },
+                  {
+                    \"service\": \"http_status:404\"
+                  }
+                ]
+              }
+            }")
+          
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "❌ Failed to configure tunnel"
+            echo "$RESPONSE" | jq '.'
+            exit 1
+          fi
+          
+          echo "✅ Tunnel configured"
 
       - name: Create DNS Record
         if: steps.config.outputs.cloudflare_enabled == 'true'
         run: |
+          echo "Creating DNS record..."
+          
           FULL_HOSTNAME="${{ steps.config.outputs.hostname }}"
-          EXISTING=$(curl -s -A "Mozilla/5.0" \
+          echo "Hostname: $FULL_HOSTNAME"
+          echo "Tunnel ID: ${{ steps.tunnel.outputs.tunnel_id }}"
+          echo "Target: ${{ steps.tunnel.outputs.tunnel_id }}.cfargotunnel.com"
+          
+          # Check for existing DNS record
+          EXISTING_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records?name=${FULL_HOSTNAME}" \
-            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" | jq -r '.result[0].id // empty')
-          [ -n "$EXISTING" ] && curl -s -A "Mozilla/5.0" \
-            "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records/${EXISTING}" \
-            --request DELETE --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" > /dev/null && sleep 2
+            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+          
+          echo "Existing DNS check response:"
+          echo "$EXISTING_RESPONSE" | jq '.'
+          
+          EXISTING=$(echo "$EXISTING_RESPONSE" | jq -r '.result[0].id // empty')
+          
+          if [ -n "$EXISTING" ]; then
+            echo "⚠️ DNS record already exists (ID: $EXISTING), deleting..."
+            DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records/${EXISTING}" \
+              --request DELETE \
+              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+            echo "Delete response:"
+            echo "$DELETE_RESPONSE" | jq '.'
+            sleep 2
+          fi
 
-          RESPONSE=$(curl -s -A "Mozilla/5.0" \
+          # Create new DNS record
+          echo "Creating new DNS record..."
+          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records" \
             --request POST \
             --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" \
             --header "Content-Type: application/json" \
-            --data "{\"type\":\"CNAME\",\"proxied\":true,\"name\":\"${FULL_HOSTNAME}\",\"content\":\"${{ steps.tunnel.outputs.tunnel_id }}.cfargotunnel.com\"}")
-          echo "$RESPONSE" | jq -r '.success' | grep -q true && echo "✅ DNS created" || { echo "❌ DNS failed"; echo "$RESPONSE" | jq '.errors'; exit 1; }
+            --data "{
+              \"type\": \"CNAME\",
+              \"proxied\": true,
+              \"name\": \"${FULL_HOSTNAME}\",
+              \"content\": \"${{ steps.tunnel.outputs.tunnel_id }}.cfargotunnel.com\"
+            }")
+          
+          echo "Create DNS response:"
+          echo "$RESPONSE" | jq '.'
+          
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "❌ Failed to create DNS record"
+            echo "Error details:"
+            echo "$RESPONSE" | jq '.errors'
+            exit 1
+          fi
+          
+          DNS_RECORD_ID=$(echo "$RESPONSE" | jq -r '.result.id')
+          echo "✅ DNS record created successfully (ID: $DNS_RECORD_ID)"
 
       - name: Start Cloudflare Tunnel
         if: steps.config.outputs.cloudflare_enabled == 'true'
         run: |
+          echo "Starting Cloudflare Tunnel..."
           cloudflared tunnel run --token ${{ steps.tunnel.outputs.tunnel_token }} > /tmp/tunnel.log 2>&1 &
           sleep 10
-          pgrep -x cloudflared > /dev/null && echo "✅ Tunnel started" || { echo "❌ Tunnel failed"; cat /tmp/tunnel.log; exit 1; }
+          
+          if ! pgrep -x "cloudflared" > /dev/null; then
+            echo "❌ Cloudflare tunnel failed to start"
+            cat /tmp/tunnel.log
+            exit 1
+          fi
+          
+          echo "✅ Cloudflare Tunnel started"
+
+      - name: Register Tunnel URL with Backend
+        if: steps.config.outputs.cloudflare_enabled == 'true'
+        run: |
+          echo "Registering tunnel URL with backend..."
+
+          FULL_HOSTNAME="${{ steps.config.outputs.hostname }}"
+          TUNNEL_URL="https://${FULL_HOSTNAME}"
+          USER_ID="${{ steps.config.outputs.user_id }}"
+          WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+          BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          CLOUDFLARE_TUNNEL_CREDENTIAL_ID="${{ steps.config.outputs.cloudflare_tunnel_credential_id }}"
+
+          # Build JSON body - include cloudflare_tunnel_credential_id only if present
+          if [ -n "$CLOUDFLARE_TUNNEL_CREDENTIAL_ID" ] && [ "$CLOUDFLARE_TUNNEL_CREDENTIAL_ID" != "null" ]; then
+            BODY="{
+              \"tunnel_url\": \"${TUNNEL_URL}\",
+              \"browser_profile_id\": \"${BROWSER_PROFILE_ID}\",
+              \"cloudflare_tunnel_credential_id\": \"${CLOUDFLARE_TUNNEL_CREDENTIAL_ID}\",
+              \"status\": \"created\",
+              \"is_active\": true
+            }"
+          else
+            BODY="{
+              \"tunnel_url\": \"${TUNNEL_URL}\",
+              \"browser_profile_id\": \"${BROWSER_PROFILE_ID}\",
+              \"status\": \"created\",
+              \"is_active\": true
+            }"
+          fi
+
+          echo "Request body: $BODY"
+
+          RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            "http://129.212.196.173/ai-management-service/api/v1/cloudflare-tunnel-info/create/" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "user-id: ${USER_ID}" \
+            -H "workspace-id: ${WORKSPACE_ID}" \
+            -d "$BODY")
+
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+          if [ "$SUCCESS" = "true" ]; then
+            echo "✅ Tunnel URL registered: ${TUNNEL_URL}"
+          else
+            echo "⚠️ Failed to register tunnel URL (non-fatal)"
+            echo "$RESPONSE" | jq '.' 2>/dev/null || echo "$RESPONSE"
+          fi
 
       - name: Display VNC Connection Info
         if: steps.config.outputs.cloudflare_enabled == 'true'
         run: |
-          echo "🌐 Access: https://${{ steps.config.outputs.hostname }}/vnc.html"
-
-      - name: Run Moti on Desktop
-        if: steps.config.outputs.vnc_enabled == 'true'
-        run: |
-          export DISPLAY=:1 NO_AT_BRIDGE=1 SESSION_MANAGER="" DBUS_SESSION_BUS_ADDRESS=/dev/null
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg \
-            libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev \
-            libavfilter-dev libswscale-dev libswresample-dev pkg-config
-
-          xfce4-terminal --maximize --title="Moti Process" \
-            --command="bash -c 'export MOTI_JOB_CONFIG=\$(echo \"${{ inputs.base64_config }}\" | base64 -d) && pip install av --upgrade && pip install moti && moti; echo Done; read'" 2>/dev/null &
-          sleep 5
-          pgrep -f "xfce4-terminal" > /dev/null && echo "✅ Moti terminal launched" || echo "⚠️ Terminal may not have started"
-
-      - name: Run Moti in Normal Terminal
-        if: steps.config.outputs.vnc_enabled == 'false'
-        timeout-minutes: 30
-        run: |
-          export MOTI_JOB_CONFIG=$(echo "${{ inputs.base64_config }}" | base64 -d)
-          pip install moti && moti
-          echo "✅ Moti completed"
-
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║          🎉 UBUNTU DESKTOP VNC IS NOW RUNNING! 🎉            ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "🌐 Access URL: https://${{ steps.config.outputs.hostname }}/vnc.html"
+          echo "🔑 Password: (configured)"
+          echo ""
+          echo "🔌 BotXByte server.py running"
+          echo "   WebSocket: ws://localhost:8765"
+          echo "   HTTP API:  http://localhost:8766"
+          echo ""
+          echo "📦 Extension ready at: ~/Downloads/real-botxbyte-extension"
+          echo "   Load it manually: Chrome > Extensions > Developer Mode > Load Unpacked"
+          echo ""
+          
       - name: Keep VNC Session Alive
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
           export PATH=$PATH:/opt/TurboVNC/bin
           export DBUS_SESSION_BUS_ADDRESS=/dev/null
-          EXTENSION_DIR="$HOME/real-botxbyte-extension"
-          CHROME_PROFILE_DIR="$HOME/chrome-botxbyte-profile"
 
-          # 355 minutes = job timeout (360) minus 5 min buffer for cleanup
-          END_TIME=$((SECONDS + 21300))
+          echo "Keeping VNC session alive..."
+
+          # Monitor for 45 mins (2700 seconds)
+          END_TIME=$((SECONDS + 2700))
 
           while [ $SECONDS -lt $END_TIME ]; do
             REMAINING=$((END_TIME - SECONDS))
-            echo "⏱️ Remaining: $((REMAINING/3600))h $(((REMAINING%3600)/60))m"
+            HOURS=$((REMAINING / 3600))
+            MINUTES=$(((REMAINING % 3600) / 60))
 
-            # Restart VNC if crashed
+            if [ "${{ steps.config.outputs.cloudflare_enabled }}" = "true" ]; then
+              echo "⏱️ Remaining: ${HOURS}h ${MINUTES}m | Access: https://${{ steps.config.outputs.hostname }}/vnc.html"
+            else
+              echo "⏱️ Remaining: ${HOURS}h ${MINUTES}m | VNC running locally"
+            fi
+
+            # Check and restart VNC if needed
             if ! pgrep -f "Xvnc.*:1" > /dev/null; then
-              echo "❌ VNC stopped, restarting..."
-              vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT && echo "✅ VNC restarted" || exit 1
-            fi
-
-            # Restart cloudflared if crashed
-            if [ "${{ steps.config.outputs.cloudflare_enabled }}" = "true" ] && ! pgrep -x cloudflared > /dev/null; then
-              echo "❌ Tunnel stopped, restarting..."
-              cloudflared tunnel run --token ${{ steps.tunnel.outputs.tunnel_token }} > /tmp/tunnel.log 2>&1 &
-              sleep 5
-              pgrep -x cloudflared > /dev/null && echo "✅ Tunnel restarted" || { cat /tmp/tunnel.log; exit 1; }
-            fi
-
-            # Restart BotXByte server if crashed
-            if ! pgrep -f "server.py" > /dev/null; then
-              echo "❌ BotXByte server stopped, restarting..."
-              cd "$EXTENSION_DIR"
-              export WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
-              nohup python3 server.py > /tmp/botxbyte-server.log 2>&1 &
+              echo "❌ VNC stopped! Restarting..."
+              vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT
               sleep 3
-              pgrep -f "server.py" > /dev/null && echo "✅ Server restarted" || cat /tmp/botxbyte-server.log
+              if ! pgrep -f "Xvnc.*:1" > /dev/null; then
+                echo "❌ Failed to restart VNC! Exiting..."
+                exit 1
+              fi
+              echo "✅ VNC restarted successfully"
             fi
 
-            # Restart Chrome if crashed
+            # Check and restart tunnel if Cloudflare is enabled
+            if [ "${{ steps.config.outputs.cloudflare_enabled }}" = "true" ]; then
+              if ! pgrep -x "cloudflared" > /dev/null; then
+                echo "❌ Tunnel stopped! Restarting..."
+                cloudflared tunnel run --token ${{ steps.tunnel.outputs.tunnel_token }} > /tmp/tunnel.log 2>&1 &
+                sleep 5
+                if ! pgrep -x "cloudflared" > /dev/null; then
+                  echo "❌ Failed to restart tunnel! Exiting..."
+                  cat /tmp/tunnel.log
+                  exit 1
+                fi
+                echo "✅ Tunnel restarted successfully"
+              fi
+            fi
+
+            # Check and restart BotXByte server if needed
+            if ! pgrep -f "server.py" > /dev/null; then
+              echo "❌ BotXByte server stopped! Restarting..."
+              EXTENSION_DIR="$HOME/Downloads/real-botxbyte-extension"
+              cd "$EXTENSION_DIR"
+              source venv/bin/activate
+              export WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+              python3 server.py &
+              sleep 3
+              if pgrep -f "server.py" > /dev/null; then
+                echo "✅ BotXByte server restarted"
+              else
+                echo "⚠️ BotXByte server failed to restart"
+              fi
+            fi
+
+            # Check and restart Chrome if needed
             if ! pgrep -f "google-chrome" > /dev/null; then
-              echo "❌ Chrome stopped, restarting..."
-              export DISPLAY=:1 NO_AT_BRIDGE=1 DBUS_SESSION_BUS_ADDRESS=/dev/null
-              rm -rf "$EXTENSION_DIR/_metadata"
+              echo "❌ Chrome stopped! Restarting..."
+              export DISPLAY=:1
+              export NO_AT_BRIDGE=1
+              PROFILE_DIR="${{ steps.browser_profile.outputs.browser_profile_dir }}"
               google-chrome \
-                --no-first-run --no-default-browser-check \
-                --disable-gpu --no-sandbox --disable-dev-shm-usage \
-                --enable-extensions \
-                --load-extension="$EXTENSION_DIR" \
-                --allow-legacy-extension-manifests \
-                --user-data-dir="$CHROME_PROFILE_DIR" \
-                --remote-debugging-port=9222 \
-                --new-window "about:blank" \
+                --no-first-run \
+                --no-default-browser-check \
+                --disable-gpu \
+                --no-sandbox \
+                --disable-dev-shm-usage \
+                --user-data-dir="$PROFILE_DIR" \
                 2>/tmp/chrome-stderr.log &
-              sleep 8
-              pgrep -f "google-chrome" > /dev/null && echo "✅ Chrome restarted" || echo "⚠️ Chrome failed to restart"
+              sleep 5
+              if pgrep -f "google-chrome" > /dev/null; then
+                echo "✅ Chrome restarted"
+              else
+                echo "⚠️ Chrome failed to restart"
+              fi
             fi
 
             sleep 30
           done
-          echo "✅ Session complete"
 
-      - name: Cleanup Webshare
-        if: always() && steps.config.outputs.webshare_enabled == 'true'
-        run: |
-          AUTH_ID="${{ steps.webshare.outputs.webshare_auth_id }}"
-          [ -n "$AUTH_ID" ] && [ "$AUTH_ID" != "null" ] && \
-            curl -s "https://proxy.webshare.io/api/v2/proxy/ipauthorization/${AUTH_ID}/" \
-              -X DELETE -H "Authorization: Token ${{ steps.config.outputs.webshare_api_token }}" > /dev/null && \
-            echo "✅ Webshare IP deregistered"
+          echo "✅ Session time expired"
 
-      - name: Cleanup BotXByte
+      - name: Cleanup BotXByte Server and Chrome
         if: always() && steps.config.outputs.vnc_enabled == 'true'
         run: |
+          echo "Cleaning up BotXByte server and Chrome..."
+
+          # Kill Chrome
           pkill -f "google-chrome" || true
+
+          # Kill server.py
           pkill -f "server.py" || true
-          echo "✅ BotXByte cleanup done"
 
-      - name: Cleanup Cloudflare
-        if: always() && steps.config.outputs.cloudflare_enabled == 'true'
-        run: |
-          pkill -x cloudflared || true
           sleep 2
+          echo "✅ BotXByte cleanup complete"
 
-          FULL_HOSTNAME="${{ steps.config.outputs.hostname }}"
-          ACCT="${{ steps.config.outputs.cloudflare_account_id }}"
-          ZONE="${{ steps.config.outputs.cloudflare_zone_id }}"
-          TOKEN="${{ steps.config.outputs.cloudflare_api_token }}"
-          TUNNEL_ID="${{ steps.tunnel.outputs.tunnel_id }}"
-          USER_ID="${{ steps.config.outputs.user_id }}"
-          WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+      - name: Upload Browser Profile to Wasabi
+        if: always() && steps.config.outputs.vnc_enabled == 'true' && steps.config.outputs.wasabi_access_key != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.config.outputs.wasabi_access_key }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.config.outputs.wasabi_secret_key }}
+          AWS_DEFAULT_REGION: ${{ steps.config.outputs.wasabi_region }}
+        run: |
+          echo "Uploading browser profile to Wasabi..."
+
           BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          WASABI_BUCKET="${{ steps.config.outputs.wasabi_bucket }}"
+          WASABI_ENDPOINT="${{ steps.config.outputs.wasabi_endpoint }}"
+          PROFILE_DIR="$HOME/browser-profiles/${BROWSER_PROFILE_ID}"
+          WASABI_KEY="browser-profiles/${BROWSER_PROFILE_ID}.zip"
 
-          if [ -n "$FULL_HOSTNAME" ] && [ "$FULL_HOSTNAME" != "null" ]; then
-            DEL_URL="http://129.212.196.173/ai-management-service/api/v1/cloudflare-tunnel-info/delete/?tunnel_url=https://${FULL_HOSTNAME}"
-            [ -n "$BROWSER_PROFILE_ID" ] && [ "$BROWSER_PROFILE_ID" != "null" ] && DEL_URL="${DEL_URL}&browser_profile_id=${BROWSER_PROFILE_ID}"
-            curl -s "$DEL_URL" -X DELETE -H "user-id: ${USER_ID}" -H "workspace-id: ${WORKSPACE_ID}" > /dev/null
+          # Debug: verify credentials are available
+          echo "  AWS_ACCESS_KEY_ID set: $([ -n "$AWS_ACCESS_KEY_ID" ] && echo 'yes' || echo 'no')"
+          echo "  AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION"
+          echo "  Wasabi Endpoint: $WASABI_ENDPOINT"
+          echo "  Wasabi Bucket: $WASABI_BUCKET"
+          echo "  Browser Profile ID: $BROWSER_PROFILE_ID"
 
-            DNS_ID=$(curl -s -A "Mozilla/5.0" \
-              "https://api.cloudflare.com/client/v4/zones/${ZONE}/dns_records?name=${FULL_HOSTNAME}" \
-              --header "Authorization: Bearer ${TOKEN}" | jq -r '.result[0].id // empty')
-            [ -n "$DNS_ID" ] && curl -s -A "Mozilla/5.0" \
-              "https://api.cloudflare.com/client/v4/zones/${ZONE}/dns_records/${DNS_ID}" \
-              --request DELETE --header "Authorization: Bearer ${TOKEN}" | jq -r 'if .success then "✅ DNS deleted" else "⚠️ DNS delete failed" end'
+          if [ -z "$BROWSER_PROFILE_ID" ] || [ "$BROWSER_PROFILE_ID" = "" ]; then
+            echo "⚠️ No browser_profile_id, skipping upload"
+            exit 0
           fi
 
-          [ -n "$TUNNEL_ID" ] && [ "$TUNNEL_ID" != "null" ] && \
-            curl -s -A "Mozilla/5.0" \
-              "https://api.cloudflare.com/client/v4/accounts/${ACCT}/cfd_tunnel/${TUNNEL_ID}" \
-              --request DELETE --header "Authorization: Bearer ${TOKEN}" | jq -r 'if .success then "✅ Tunnel deleted" else "⚠️ Tunnel delete failed" end'
+          if [ ! -d "$PROFILE_DIR" ]; then
+            echo "⚠️ Browser profile directory not found: $PROFILE_DIR, skipping upload"
+            ls -la "$HOME/browser-profiles/" 2>/dev/null || echo "  browser-profiles dir does not exist"
+            exit 0
+          fi
+
+          echo "Zipping browser profile: $PROFILE_DIR"
+          echo "  Profile size before zip: $(du -sh "$PROFILE_DIR" | cut -f1)"
+
+          cd "$HOME/browser-profiles"
+          zip -r "/tmp/${BROWSER_PROFILE_ID}.zip" "${BROWSER_PROFILE_ID}/" -x "*/SingletonLock" "*/SingletonCookie" "*/SingletonSocket"
+
+          ZIP_SIZE=$(du -sh "/tmp/${BROWSER_PROFILE_ID}.zip" | cut -f1)
+          echo "  Zip size: $ZIP_SIZE"
+
+          echo "Uploading to Wasabi: s3://${WASABI_BUCKET}/${WASABI_KEY}"
+          aws s3 cp "/tmp/${BROWSER_PROFILE_ID}.zip" "s3://${WASABI_BUCKET}/${WASABI_KEY}" \
+            --endpoint-url "$WASABI_ENDPOINT"
+
+          echo "✅ Browser profile uploaded to Wasabi successfully"
+          echo "  Bucket: $WASABI_BUCKET"
+          echo "  Key: $WASABI_KEY"
+          echo "  Size: $ZIP_SIZE"
+
+          rm -f "/tmp/${BROWSER_PROFILE_ID}.zip"
+
+      - name: Cleanup Webshare IP Authorization
+        if: always() && steps.config.outputs.webshare_enabled == 'true'
+        run: |
+          echo "Deregistering IP from Webshare..."
+          
+          if [ -n "${{ steps.webshare.outputs.webshare_auth_id }}" ] && [ "${{ steps.webshare.outputs.webshare_auth_id }}" != "null" ]; then
+            DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              "https://proxy.webshare.io/api/v2/proxy/ipauthorization/${{ steps.webshare.outputs.webshare_auth_id }}/" \
+              -X DELETE \
+              -H "Authorization: Token ${{ steps.config.outputs.webshare_api_token }}")
+            
+            # Check if deletion was successful (empty response or 204 status)
+            if [ -z "$DELETE_RESPONSE" ] || [ "$DELETE_RESPONSE" = "{}" ]; then
+              echo "✅ IP authorization removed from Webshare"
+            else
+              echo "⚠️ Failed to remove IP authorization"
+              echo "$DELETE_RESPONSE"
+            fi
+          else
+            echo "⚠️ No Webshare authorization ID found to delete"
+          fi
+          
+          echo "✅ Webshare cleanup complete"
+
+      - name: Cleanup Cloudflare Tunnel and DNS
+        if: always() && steps.config.outputs.cloudflare_enabled == 'true'
+        run: |
+          echo "Cleaning up Cloudflare tunnel and DNS record..."
+          
+          # Stop cloudflared process
+          pkill -x cloudflared || true
+          sleep 2
+          
+          # Delete tunnel info from AI Management Service
+          FULL_HOSTNAME="${{ steps.config.outputs.hostname }}"
+          if [ -n "$FULL_HOSTNAME" ] && [ "$FULL_HOSTNAME" != "null" ]; then
+            echo "Deleting tunnel info from AI Management Service..."
+            
+            USER_ID="${{ steps.config.outputs.user_id }}"
+            WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+            BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+            
+            # Build URL with parameters
+            DELETE_URL="http://129.212.196.173/ai-management-service/api/v1/cloudflare-tunnel-info/delete/?tunnel_url=https://${FULL_HOSTNAME}"
+            
+            # Add browser_profile_id if it exists
+            if [ -n "$BROWSER_PROFILE_ID" ] && [ "$BROWSER_PROFILE_ID" != "null" ]; then
+              DELETE_URL="${DELETE_URL}&browser_profile_id=${BROWSER_PROFILE_ID}"
+            fi
+            
+            DELETE_TUNNEL_INFO=$(curl -s --connect-timeout 10 --max-time 30 "$DELETE_URL" \
+              -X DELETE \
+              -H "user-id: ${USER_ID}" \
+              -H "workspace-id: ${WORKSPACE_ID}")
+            
+            echo "Tunnel info deletion response:"
+            echo "$DELETE_TUNNEL_INFO"
+          fi
+          
+          # Delete DNS record
+          if [ -n "$FULL_HOSTNAME" ] && [ "$FULL_HOSTNAME" != "null" ]; then
+            echo "Deleting DNS record for ${FULL_HOSTNAME}..."
+            EXISTING_DNS=$(curl -s --connect-timeout 10 --max-time 30 \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records?name=${FULL_HOSTNAME}" \
+              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" | jq -r '.result[0].id // empty')
+            
+            if [ -n "$EXISTING_DNS" ]; then
+              DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                "https://api.cloudflare.com/client/v4/zones/${{ steps.config.outputs.cloudflare_zone_id }}/dns_records/${EXISTING_DNS}" \
+                --request DELETE \
+                --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+              
+              DELETE_SUCCESS=$(echo "$DELETE_RESPONSE" | jq -r '.success // false')
+              if [ "$DELETE_SUCCESS" = "true" ]; then
+                echo "✅ DNS record deleted successfully"
+              else
+                echo "⚠️ Failed to delete DNS record"
+                echo "$DELETE_RESPONSE" | jq '.'
+              fi
+            else
+              echo "⚠️ DNS record not found"
+            fi
+          fi
+          
+          # Delete Cloudflare tunnel
+          if [ -n "${{ steps.tunnel.outputs.tunnel_id }}" ] && [ "${{ steps.tunnel.outputs.tunnel_id }}" != "null" ]; then
+            echo "Deleting Cloudflare tunnel ${{ steps.tunnel.outputs.tunnel_id }}..."
+            TUNNEL_DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${{ steps.tunnel.outputs.tunnel_id }}" \
+              --request DELETE \
+              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+            
+            TUNNEL_DELETE_SUCCESS=$(echo "$TUNNEL_DELETE_RESPONSE" | jq -r '.success // false')
+            if [ "$TUNNEL_DELETE_SUCCESS" = "true" ]; then
+              echo "✅ Cloudflare tunnel deleted successfully"
+            else
+              echo "⚠️ Failed to delete Cloudflare tunnel"
+              echo "$TUNNEL_DELETE_RESPONSE" | jq '.'
+            fi
+          else
+            echo "⚠️ Tunnel ID not found"
+          fi
+          
+          echo "✅ Cloudflare cleanup complete"
 
       - name: Cleanup VNC
         if: always() && steps.config.outputs.vnc_enabled == 'true'
         run: |
           export PATH=$PATH:/opt/TurboVNC/bin
+          echo "Cleaning up VNC server..."
+          
           vncserver -kill :1 || true
-          echo "✅ VNC cleanup done"
+          
+          echo "✅ VNC cleanup complete"
